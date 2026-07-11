@@ -2,8 +2,9 @@
 name = "alfred-writer"
 version = "2.0.0"
 edition = "2021"
-description = "System-wide AI grammar and style checker for Windows, powered by Claude."
+description = "System-wide AI grammar and style checker for Windows (AW), powered by a local model or an external command."
 default-run = "alfred-writer"
+build = "build.rs"
 
 [lib]
 name = "alfred_writer"
@@ -27,6 +28,7 @@ anyhow = "1"
 directories = "5"
 arboard = "3"
 ureq = { version = "2", features = ["json"] }
+ico = "0.3"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
@@ -41,3 +43,6 @@ features = [
     "Win32_System_Ole",
     "Win32_System_Threading",
 ]
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

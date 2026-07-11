@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use alfred_writer::{app, automation, config, tray};
+use alfred_writer::{app, automation, config, theme, tray};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
@@ -15,11 +15,26 @@ fn main() -> eframe::Result<()> {
     let tray_handle = tray::build(enabled).expect("failed to create system tray icon");
     let quit = Arc::new(AtomicBool::new(false));
 
+    // Gives every window (the Settings window's title bar, Alt-Tab) the same AW badge as
+    // the tray icon and the compiled-in .exe icon (embedded via build.rs), rather than
+    // falling back to a generic default.
+    let icon_size = 64;
+    let window_icon = eframe::egui::IconData {
+        rgba: theme::badge_rgba(icon_size),
+        width: icon_size,
+        height: icon_size,
+    };
+
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_visible(false)
             .with_decorations(false)
-            .with_inner_size([1.0, 1.0]),
+            .with_inner_size([1.0, 1.0])
+            .with_icon(window_icon)
+            // This app lives in the tray, not the taskbar — without this, the invisible
+            // root window still claims a taskbar slot (an empty, unclickable one, since
+            // it's never shown), which is confusing clutter next to the real tray icon.
+            .with_taskbar(false),
         ..Default::default()
     };
 

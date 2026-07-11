@@ -1,3 +1,4 @@
+use crate::theme;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
@@ -38,7 +39,7 @@ pub fn build(enabled: bool) -> anyhow::Result<TrayHandle> {
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("Alfred Writer")
+        .with_tooltip("Alfred Writer (AW)")
         .with_icon(build_icon())
         .build()?;
 
@@ -73,24 +74,9 @@ pub fn build(enabled: bool) -> anyhow::Result<TrayHandle> {
     Ok(TrayHandle { rx, _tray: tray })
 }
 
+/// The tray's two-tone AW badge — see [`theme::badge_rgba`] for why it's ring+fill only,
+/// no monogram text, at this size.
 fn build_icon() -> Icon {
-    let size: u32 = 32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    let cx = size as f32 / 2.0;
-    let cy = size as f32 / 2.0;
-    let r = size as f32 / 2.0 - 1.0;
-    for y in 0..size {
-        for x in 0..size {
-            let idx = ((y * size + x) * 4) as usize;
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            if dx * dx + dy * dy <= r * r {
-                rgba[idx] = 0x4b;
-                rgba[idx + 1] = 0x3f;
-                rgba[idx + 2] = 0xd6;
-                rgba[idx + 3] = 0xff;
-            }
-        }
-    }
-    Icon::from_rgba(rgba, size, size).expect("valid icon buffer")
+    let size = 32;
+    Icon::from_rgba(theme::badge_rgba(size), size, size).expect("valid icon buffer")
 }

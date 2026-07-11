@@ -8,4 +8,5 @@ pub mod config;
 pub mod input;
 pub mod providers;
 pub mod targets;
+pub mod theme;
 pub mod tray;

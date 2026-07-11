@@ -1,17 +1,13 @@
 use crate::automation::{AutomationCmd, Rect, UiEvent};
 use crate::config::Config;
 use crate::providers::{ExternalCommandConfig, InputMode, Issue, LocalConfig, ProviderConfig};
+use crate::theme;
 use crate::tray::TrayEvent;
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-
-const PURPLE: egui::Color32 = egui::Color32::from_rgb(0x4b, 0x3f, 0xd6);
-const RED: egui::Color32 = egui::Color32::from_rgb(0xb4, 0x23, 0x18);
-const GREEN: egui::Color32 = egui::Color32::from_rgb(0x06, 0x76, 0x47);
-const GREY: egui::Color32 = egui::Color32::from_rgb(0x6b, 0x70, 0x85);
 
 #[derive(Clone)]
 enum PopupState {
@@ -48,7 +44,8 @@ impl ProviderKind {
 }
 
 /// Editable form of [`ExternalCommandConfig`]: `args_template` becomes one line of text
-/// per argument, and `timeout_secs` becomes a plain text field, so egui can edit them.
+/// per argument, `env` becomes one `KEY=VALUE` per line, and `timeout_secs` becomes a
+/// plain text field, so egui can edit them.
 struct ExternalCommandDraft {
     command: String,
     args_text: String,
@@ -57,6 +54,7 @@ struct ExternalCommandDraft {
     error_path: String,
     model: String,
     timeout_secs: String,
+    env_text: String,
 }
 
 impl From<&ExternalCommandConfig> for ExternalCommandDraft {
@@ -68,6 +66,7 @@ impl From<&ExternalCommandConfig> for ExternalCommandDraft {
             response_path: c.response_path.clone().unwrap_or_default(),
             error_path: c.error_path.clone().unwrap_or_default(),
             model: c.model.clone(),
+            env_text: c.env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n"),
             timeout_secs: c.timeout_secs.to_string(),
         }
     }
@@ -83,6 +82,12 @@ impl ExternalCommandDraft {
             error_path: none_if_blank(&self.error_path),
             model: self.model.clone(),
             timeout_secs: self.timeout_secs.parse().unwrap_or(45),
+            env: self
+                .env_text
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .collect(),
         }
     }
 }
@@ -179,6 +184,8 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        theme::apply_visuals(ctx);
+
         while let Ok(ev) = self.ui_rx.try_recv() {
             match ev {
                 UiEvent::Hide => self.popup = None,
@@ -230,9 +237,16 @@ impl App {
         let id = egui::ViewportId::from_hash_of("alfred-writer-settings");
         let mut open = true;
         let mut builder = egui::ViewportBuilder::default()
-            .with_title("Alfred Writer — Settings")
-            .with_inner_size([440.0, 480.0])
-            .with_resizable(false);
+            .with_title("Alfred Writer (AW) — Settings")
+            .with_inner_size([460.0, 680.0])
+            .with_min_inner_size([380.0, 320.0])
+            .with_resizable(true)
+            .with_taskbar(false)
+            .with_icon(egui::IconData {
+                rgba: theme::badge_rgba(64),
+                width: 64,
+                height: 64,
+            });
         if self.settings_open_request {
             builder = builder.with_position(egui::pos2(200.0, 200.0));
             self.settings_open_request = false;
@@ -243,44 +257,67 @@ impl App {
 
         ctx.show_viewport_immediate(id, builder, |ctx, _class| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.heading("Alfred Writer");
-                ui.label("Grammar and style checking, system-wide, powered by a local model or an external command you control.");
-                ui.add_space(10.0);
-
-                ui.label("Provider");
-                egui::ComboBox::from_id_source("provider_combo")
-                    .selected_text(draft.provider_kind.label())
-                    .show_ui(ui, |ui| {
-                        for kind in ProviderKind::ALL {
-                            ui.selectable_value(&mut draft.provider_kind, kind, kind.label());
-                        }
+                // The whole panel scrolls (rather than just the provider-fields block)
+                // so nothing gets silently cut off if the window is resized smaller than
+                // the current provider's field list needs.
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        theme::draw_badge(ui, 28.0);
+                        ui.vertical(|ui| {
+                            ui.heading(egui::RichText::new("Alfred Writer").strong().color(theme::SLATE));
+                            ui.label(egui::RichText::new("AW").small().color(theme::MUTED));
+                        });
                     });
-                ui.add_space(8.0);
+                    ui.add_space(4.0);
+                    ui.label("Grammar and style checking, system-wide, powered by a local model or an external command you control.");
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
 
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    show_provider_fields(ui, draft);
-                });
+                    ui.label(egui::RichText::new("Provider").strong().color(theme::SLATE));
+                    egui::ComboBox::from_id_source("provider_combo")
+                        .selected_text(draft.provider_kind.label())
+                        .show_ui(ui, |ui| {
+                            for kind in ProviderKind::ALL {
+                                ui.selectable_value(&mut draft.provider_kind, kind, kind.label());
+                            }
+                        });
+                    ui.add_space(8.0);
 
-                ui.add_space(8.0);
-                ui.checkbox(&mut draft.enabled, "Enabled");
+                    egui::Frame::none()
+                        .fill(theme::SURFACE_TINT)
+                        .rounding(6.0)
+                        .inner_margin(egui::Margin::same(10.0))
+                        .show(ui, |ui| {
+                            show_provider_fields(ui, draft);
+                        });
 
-                ui.add_space(12.0);
-                if ui.button("Save").clicked() {
-                    let mut c = config.lock().unwrap();
-                    c.provider = draft.to_provider_config();
-                    c.enabled = draft.enabled;
-                    let _ = c.save();
-                    draft.status = Some(("Saved.".to_string(), Instant::now()));
-                }
+                    ui.add_space(10.0);
+                    ui.checkbox(&mut draft.enabled, egui::RichText::new("Enabled").strong());
 
-                if let Some((msg, at)) = &draft.status {
-                    if at.elapsed().as_secs_f32() < 1.8 {
-                        ui.label(egui::RichText::new(msg).color(GREEN));
-                    } else {
-                        draft.status = None;
+                    ui.add_space(12.0);
+                    let save_button = egui::Button::new(egui::RichText::new("Save").strong().color(egui::Color32::WHITE))
+                        .fill(theme::MAGENTA);
+                    if ui.add(save_button).clicked() {
+                        let mut c = config.lock().unwrap();
+                        c.provider = draft.to_provider_config();
+                        c.enabled = draft.enabled;
+                        let _ = c.save();
+                        draft.status = Some(("Saved.".to_string(), Instant::now()));
                     }
-                }
+
+                    if let Some((msg, at)) = &draft.status {
+                        if at.elapsed().as_secs_f32() < 1.8 {
+                            ui.horizontal(|ui| {
+                                theme::draw_check_icon(ui, 13.0, theme::SAGE_TEXT);
+                                ui.label(egui::RichText::new(msg).strong().color(theme::SAGE_TEXT));
+                            });
+                        } else {
+                            draft.status = None;
+                        }
+                    }
+                });
             });
 
             if ctx.input(|i| i.viewport().close_requested()) {
@@ -301,11 +338,11 @@ impl App {
         };
 
         let body_height: f32 = match popup {
-            PopupState::Loading { .. } => 40.0,
-            PopupState::Error { .. } => 60.0,
-            PopupState::Issues { issues, .. } => (issues.len() as f32 * 92.0).clamp(60.0, 300.0),
+            PopupState::Loading { .. } => 44.0,
+            PopupState::Error { .. } => 64.0,
+            PopupState::Issues { issues, .. } => (issues.len() as f32 * 104.0).clamp(64.0, 320.0),
         };
-        let window_height = 70.0 + body_height;
+        let window_height = 76.0 + body_height;
 
         let id = egui::ViewportId::from_hash_of("alfred-writer-popup");
         let builder = egui::ViewportBuilder::default()
@@ -315,7 +352,8 @@ impl App {
             .with_decorations(false)
             .with_always_on_top()
             .with_resizable(false)
-            .with_transparent(true);
+            .with_transparent(true)
+            .with_taskbar(false);
 
         let mut close_clicked = false;
         let mut apply_click: Option<(usize, String, String)> = None;
@@ -326,9 +364,10 @@ impl App {
                 .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::WHITE))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Alfred Writer").strong().color(PURPLE));
+                        theme::draw_badge(ui, 20.0);
+                        ui.label(egui::RichText::new("Alfred Writer").strong().color(theme::SLATE));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("✕").clicked() {
+                            if theme::close_button(ui, 18.0).clicked() {
                                 close_clicked = true;
                             }
                         });
@@ -337,10 +376,22 @@ impl App {
 
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| match popup {
                         PopupState::Loading { .. } => {
-                            ui.label("Checking your writing…");
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(egui::RichText::new("Checking your writing…").strong().color(theme::SLATE));
+                            });
                         }
                         PopupState::Error { message, .. } => {
-                            ui.colored_label(RED, message);
+                            egui::Frame::none()
+                                .fill(theme::DANGER_TINT)
+                                .rounding(6.0)
+                                .inner_margin(egui::Margin::same(8.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new("Error").strong().color(theme::DANGER));
+                                        ui.colored_label(theme::DANGER, message);
+                                    });
+                                });
                         }
                         PopupState::Issues { issues, .. } => {
                             for (i, issue) in issues.iter().enumerate() {
@@ -349,30 +400,45 @@ impl App {
                                 // auto-generated egui ID (same call site each loop turn),
                                 // which causes ID clashes and scrambles click routing.
                                 ui.push_id(i, |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.colored_label(RED, egui::RichText::new(&issue.original).strikethrough());
-                                        ui.colored_label(GREY, "→");
-                                        ui.colored_label(GREEN, egui::RichText::new(&issue.suggestion).strong());
-                                    });
+                                    egui::Frame::none()
+                                        .fill(theme::SURFACE_TINT)
+                                        .rounding(6.0)
+                                        .inner_margin(egui::Margin::same(8.0))
+                                        .show(ui, |ui| {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.colored_label(theme::DANGER, egui::RichText::new(&issue.original).strikethrough());
+                                                theme::draw_arrow_icon(ui, 14.0, theme::MUTED);
+                                                ui.colored_label(theme::SAGE_TEXT, egui::RichText::new(&issue.suggestion).strong());
+                                            });
 
-                                    if !issue.explanation.is_empty() {
-                                        ui.colored_label(GREY, &issue.explanation);
-                                    }
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Apply").clicked() {
-                                            apply_click = Some((i, issue.original.clone(), issue.suggestion.clone()));
-                                        }
-                                        if ui.button("Dismiss").clicked() {
-                                            dismiss_click = Some(i);
-                                        }
-                                    });
-                                    ui.separator();
+                                            if !issue.explanation.is_empty() {
+                                                ui.colored_label(theme::MUTED, &issue.explanation);
+                                            }
+                                            ui.add_space(4.0);
+                                            ui.horizontal(|ui| {
+                                                theme::draw_check_icon(ui, 13.0, theme::SAGE_TEXT);
+                                                let apply_button = egui::Button::new(
+                                                    egui::RichText::new("Apply").strong().color(egui::Color32::WHITE),
+                                                )
+                                                .fill(theme::SAGE_TEXT);
+                                                if ui.add(apply_button).clicked() {
+                                                    apply_click = Some((i, issue.original.clone(), issue.suggestion.clone()));
+                                                }
+                                                ui.add_space(4.0);
+                                                theme::draw_cross_icon(ui, 13.0, theme::MUTED);
+                                                if ui.button(egui::RichText::new("Dismiss").color(theme::MUTED)).clicked() {
+                                                    dismiss_click = Some(i);
+                                                }
+                                            });
+                                        });
+                                    ui.add_space(6.0);
                                 });
                             }
                         }
                     });
 
-                    ui.small("Powered by your configured provider · double-check important text");
+                    ui.separator();
+                    ui.small(egui::RichText::new("Powered by your configured provider · double-check important text").color(theme::MUTED));
                 });
 
             if ctx.input(|i| i.viewport().close_requested()) {
@@ -423,7 +489,9 @@ fn show_provider_fields(ui: &mut egui::Ui, draft: &mut SettingsDraft) {
             ui.label("Command");
             ui.text_edit_singleline(&mut draft.external.command);
             ui.label("Arguments (one per line; supports {model} {system_prompt} {schema} {prompt})");
-            ui.add(egui::TextEdit::multiline(&mut draft.external.args_text).desired_rows(6));
+            egui::ScrollArea::vertical().id_source("args_scroll").max_height(110.0).show(ui, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut draft.external.args_text).desired_rows(6).desired_width(f32::INFINITY));
+            });
 
             ui.horizontal(|ui| {
                 ui.label("Input mode:");
@@ -444,6 +512,9 @@ fn show_provider_fields(ui: &mut egui::Ui, draft: &mut SettingsDraft) {
                 ui.label("Timeout (seconds):");
                 ui.text_edit_singleline(&mut draft.external.timeout_secs);
             });
+
+            ui.label("Environment variables (one KEY=VALUE per line, optional)");
+            ui.add(egui::TextEdit::multiline(&mut draft.external.env_text).desired_rows(2).desired_width(f32::INFINITY));
 
             ui.add_space(6.0);
             ui.small("Authentication is entirely up to the command itself. The default runs the Claude Code CLI, reusing your existing `claude` login — no API key needed here.");

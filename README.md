@@ -1,6 +1,8 @@
-# Alfred Writer
+# Alfred Writer (AW)
 
 A grammar and style checker for Windows — a native, system-wide app (no browser required) that works in any text field on your desktop, powered by a local model or a command you control. No commercial cloud API is called directly by this app.
+
+"AW" for short — it's what the tray tooltip, window titles, and the badge icon in every window use as shorthand for Alfred Writer.
 
 ## How it works
 

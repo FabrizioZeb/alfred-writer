@@ -50,6 +50,13 @@ pub struct ExternalCommandConfig {
     /// string rather than an issue list.
     pub error_path: Option<String>,
     pub timeout_secs: u64,
+    /// Extra environment variables set on the child process, on top of whatever it
+    /// inherits from Alfred Writer itself. This is how a preset can shave startup-latency
+    /// overhead specific to its command (e.g. telling a CLI to skip an update check)
+    /// without that vendor-specific knowledge leaking into this file's actual code — see
+    /// `claude_code_preset` for a concrete example.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 impl ExternalCommandConfig {
@@ -80,6 +87,14 @@ impl ExternalCommandConfig {
             error_path: Some("is_error".to_string()),
             model: "claude-haiku-4-5".to_string(),
             timeout_secs: 45,
+            // Every check pays the CLI's full cold-start cost (process creation, config
+            // and credential loading, and — normally — a version/update check that phones
+            // home before doing anything else). This env var is Claude Code's documented
+            // switch for skipping that non-essential network round trip; it directly cuts
+            // per-check latency and is harmless if a given CLI version doesn't recognize
+            // it. Worth re-verifying against `claude --help`/current docs if a future CLI
+            // version renames or removes it.
+            env: vec![("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(), "1".to_string())],
         }
     }
 }
@@ -131,12 +146,14 @@ impl LlmProvider for ExternalCommandProvider {
         let mut command = Command::new(&self.config.command);
         command
             .args(&args)
+            .envs(self.config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .current_dir(std::env::temp_dir())
             .stdin(stdin_cfg)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW);
 
+        let start = Instant::now();
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -172,7 +189,6 @@ impl LlmProvider for ExternalCommandProvider {
             buf
         });
 
-        let start = Instant::now();
         let timeout = Duration::from_secs(self.config.timeout_secs);
         loop {
             if cancel.is_cancelled() {
@@ -190,6 +206,12 @@ impl LlmProvider for ExternalCommandProvider {
                         let _ = child.wait();
                         let _ = stdout_reader.join();
                         let _ = stderr_reader.join();
+                        eprintln!(
+                            "[alfred-writer] {} timed out after {:.1}s (timeout_secs={})",
+                            self.config.command,
+                            start.elapsed().as_secs_f32(),
+                            self.config.timeout_secs
+                        );
                         return ProviderResponse::Error(format!("`{}` took too long to respond.", self.config.command));
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -201,6 +223,18 @@ impl LlmProvider for ExternalCommandProvider {
                 }
             }
         }
+
+        // Silent in a normal release run (no attached console) — only visible if stderr
+        // is redirected when launching. This is the number to look at when a check
+        // "feels slow": it's wall-clock spawn-to-exit for the whole external process, so
+        // it separates "the command itself is slow" from "our own gating (debounce/
+        // cooldown) made it feel slow", which is a much easier thing to misdiagnose from
+        // the UI alone.
+        eprintln!(
+            "[alfred-writer] {} finished in {:.2}s",
+            self.config.command,
+            start.elapsed().as_secs_f32()
+        );
 
         let stdout_bytes = stdout_reader.join().unwrap_or_default();
         let stderr_bytes = stderr_reader.join().unwrap_or_default();
@@ -373,6 +407,7 @@ mod tests {
             error_path: None,
             model: "x".to_string(),
             timeout_secs: 20,
+            env: vec![],
         };
         let provider = ExternalCommandProvider::new(config);
         let request = PromptRequest {
