@@ -1,0 +1,11 @@
+Design Notes: Request Retry Strategy
+
+The current implementation retry every failed request immediately, which as caused a thundering herd problem whenever the upstream service degrades. When latency spikes past our timeout threshold, hundreds of clients ends up retrying within the same hundred-millisecond window, which just pushes the upstream service further into a unhealthy state.
+
+We should of implemented exponential backoff with jitter from the start, but the original design assumed failures would be rare and isolated. In practice, failures is correlated far more often then not, since they usually stem from a shared dependency like the database connection pool or a downstream API that multiple services relies on.
+
+The proposed fix introduces a backoff schedule that double's the delay after each consecutive failure, up to a configurable maximum, with a random jitter factor applied so that clients don't all wake up and retry at exactly the same moment. We also plan to add a circuit breaker so that after a certain number of consecutive failures, the client stops retrying all together for a cooldown period and instead returns a fast failure to it's caller.
+
+One open question is whether the circuit breaker state should be shared across all instances of a service, or kept local to each instance. A shared state would react faster, but it introduces it's own dependency on a coordination service, which somewhat defeats the purpose of trying to reduce load on shared infrastructure during an incident. For now, we are leaning towards per-instance state, accepting that it will take slightly longer for the whole fleet to converge on "the upstream is down," in exchange for one less thing that can fail during an outage.
+
+Metrics-wise, we need better visibility into retry counts broken down by error type, not just an aggregate retry rate, since a spike in retries caused by client bugs looks identical to a spike caused by a genuine upstream incident unless the two is separated out.

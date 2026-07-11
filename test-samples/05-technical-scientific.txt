@@ -1,0 +1,9 @@
+Abstract
+
+Chronic low-grade inflammation have been implicated in a wide range of age-related conditions, including atherosclerosis, insulin resistance, and neurodegeneration, yet the causal directionality between inflammatory signalling and cellular senescence remain incompletely characterised. In this study, we examine wether senescent cell burden precedes or follows the onset of systemic inflammation in a murine model, using a combination of single-cell transcriptomics and longitudinal serum cytokine profiling.
+
+Our results indicates that senescent cell accumulation in visceral adipose tissue is detectable several weeks before measurable elevations in circulating IL-6 and TNF-alpha, suggesting that senescence-associated secretory phenotype (SASP) activity may act as a upstream driver of systemic inflammation rather then a downstream consequence of it. This finding is consistent with, but does not definitively confirm, the hypothesis that targeted clearance of senescent cells could delay or attenuate inflammaging, since correlation in this dataset cannot fully rule out a shared upstream trigger effecting both processes independently.
+
+Notably, animals treated with a senolytic compound at the eight-week mark showed a significant reduction in SASP-associated cytokine expression by week twelve, compared to vehicle-treated controls, however overall lifespan extension in this cohort did not reach statistical significance (p = 0.08), which may reflect the relatively short duration of the study or an insufficient sample size to detect a modest effect.
+
+Further work is needed to determine whether earlier intervention, before senescent burden reaches the threshold observed in this cohort, produces a more pronounced effect on both inflammatory markers and downstream functional outcomes such as glucose tolerance and grip strength, which we were unable to fully assess within the current experimental timeline.

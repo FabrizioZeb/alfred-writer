@@ -1,0 +1,16 @@
+Subject: Follow-up on Tuesday's Meeting
+
+Hi team,
+
+Thank you all for attending the meeting on tuesday. I wanted to summarise the key points we discussed and outline the next steps, so everyone are on the same page going forward.
+
+First, we agreed that the current onboarding process take too long, and that new hires is often left waiting several days before they recieve access to the internal tools they need. Sarah volunteered to audit the process and report back by Friday.
+
+Second, there was some disagreement about wether we should prioritize the mobile redesign or the backend migration this quarter. After some discussion, we decided that the backend migration should come first, since it effects the stability of everything else we build on top of it.
+
+Finally, please remember to submit you're expense reports before the end of the month. Finance has asked us multiple times, and late submissions is becoming a real problem for they're reconciliation process.
+
+Let me know if I missed anything, or if you have any questions about the action items above.
+
+Best,
+Alex
