@@ -3,7 +3,7 @@
 //! "Performance/cost architecture" table in ARCHITECTURE.md — this is one of four gates
 //! that exist together on purpose; don't remove it in isolation.
 
-use crate::claude::Issue;
+use crate::providers::Issue;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 

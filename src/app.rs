@@ -1,6 +1,6 @@
 use crate::automation::{AutomationCmd, Rect, UiEvent};
-use crate::claude::Issue;
-use crate::config::{Config, MODELS};
+use crate::config::Config;
+use crate::providers::{ExternalCommandConfig, InputMode, Issue, LocalConfig, ProviderConfig};
 use crate::tray::TrayEvent;
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,10 +20,112 @@ enum PopupState {
     Error { rect: Rect, message: String },
 }
 
+/// Which provider type is selected in the Settings dropdown. Kept distinct from
+/// [`ProviderConfig`] so switching the dropdown mid-edit doesn't lose whatever was
+/// already typed into the other providers' fields this session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    Local,
+    ExternalCommand,
+}
+
+impl ProviderKind {
+    const ALL: [ProviderKind; 2] = [ProviderKind::Local, ProviderKind::ExternalCommand];
+
+    fn label(self) -> &'static str {
+        match self {
+            ProviderKind::Local => "Local (Ollama / LM Studio)",
+            ProviderKind::ExternalCommand => "External command",
+        }
+    }
+
+    fn from_config(config: &ProviderConfig) -> Self {
+        match config {
+            ProviderConfig::Local(_) => ProviderKind::Local,
+            ProviderConfig::ExternalCommand(_) => ProviderKind::ExternalCommand,
+        }
+    }
+}
+
+/// Editable form of [`ExternalCommandConfig`]: `args_template` becomes one line of text
+/// per argument, and `timeout_secs` becomes a plain text field, so egui can edit them.
+struct ExternalCommandDraft {
+    command: String,
+    args_text: String,
+    input_mode: InputMode,
+    response_path: String,
+    error_path: String,
+    model: String,
+    timeout_secs: String,
+}
+
+impl From<&ExternalCommandConfig> for ExternalCommandDraft {
+    fn from(c: &ExternalCommandConfig) -> Self {
+        Self {
+            command: c.command.clone(),
+            args_text: c.args_template.join("\n"),
+            input_mode: c.input_mode,
+            response_path: c.response_path.clone().unwrap_or_default(),
+            error_path: c.error_path.clone().unwrap_or_default(),
+            model: c.model.clone(),
+            timeout_secs: c.timeout_secs.to_string(),
+        }
+    }
+}
+
+impl ExternalCommandDraft {
+    fn to_config(&self) -> ExternalCommandConfig {
+        ExternalCommandConfig {
+            command: self.command.clone(),
+            args_template: self.args_text.lines().map(str::to_string).filter(|s| !s.is_empty()).collect(),
+            input_mode: self.input_mode,
+            response_path: none_if_blank(&self.response_path),
+            error_path: none_if_blank(&self.error_path),
+            model: self.model.clone(),
+            timeout_secs: self.timeout_secs.parse().unwrap_or(45),
+        }
+    }
+}
+
+fn none_if_blank(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 struct SettingsDraft {
-    model_idx: usize,
+    provider_kind: ProviderKind,
+    local: LocalConfig,
+    external: ExternalCommandDraft,
     enabled: bool,
     status: Option<(String, Instant)>,
+}
+
+impl SettingsDraft {
+    fn from_config(config: &Config) -> Self {
+        let mut draft = Self {
+            provider_kind: ProviderKind::from_config(&config.provider),
+            local: LocalConfig::default(),
+            external: ExternalCommandDraft::from(&ExternalCommandConfig::default()),
+            enabled: config.enabled,
+            status: None,
+        };
+        match &config.provider {
+            ProviderConfig::Local(c) => draft.local = c.clone(),
+            ProviderConfig::ExternalCommand(c) => draft.external = ExternalCommandDraft::from(c),
+        }
+        draft
+    }
+
+    fn to_provider_config(&self) -> ProviderConfig {
+        match self.provider_kind {
+            ProviderKind::Local => ProviderConfig::Local(self.local.clone()),
+            ProviderKind::ExternalCommand => ProviderConfig::ExternalCommand(self.external.to_config()),
+        }
+    }
 }
 
 pub struct App {
@@ -56,14 +158,7 @@ impl App {
         automation_cmd_tx: Sender<AutomationCmd>,
         quit: Arc<AtomicBool>,
     ) -> Self {
-        let c = config.lock().unwrap();
-        let model_idx = MODELS.iter().position(|m| *m == c.model).unwrap_or(0);
-        let draft = SettingsDraft {
-            model_idx,
-            enabled: c.enabled,
-            status: None,
-        };
-        drop(c);
+        let draft = SettingsDraft::from_config(&config.lock().unwrap());
         Self {
             config,
             ui_rx,
@@ -136,7 +231,7 @@ impl App {
         let mut open = true;
         let mut builder = egui::ViewportBuilder::default()
             .with_title("Alfred Writer — Settings")
-            .with_inner_size([360.0, 260.0])
+            .with_inner_size([440.0, 480.0])
             .with_resizable(false);
         if self.settings_open_request {
             builder = builder.with_position(egui::pos2(200.0, 200.0));
@@ -150,17 +245,22 @@ impl App {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.heading("Alfred Writer");
-                ui.label("Grammar and style checking, system-wide, powered by Claude Code.");
+                ui.label("Grammar and style checking, system-wide, powered by a local model or an external command you control.");
                 ui.add_space(10.0);
 
-                ui.label("Model");
-                egui::ComboBox::from_id_source("model_combo")
-                    .selected_text(MODELS[draft.model_idx])
+                ui.label("Provider");
+                egui::ComboBox::from_id_source("provider_combo")
+                    .selected_text(draft.provider_kind.label())
                     .show_ui(ui, |ui| {
-                        for (i, m) in MODELS.iter().enumerate() {
-                            ui.selectable_value(&mut draft.model_idx, i, *m);
+                        for kind in ProviderKind::ALL {
+                            ui.selectable_value(&mut draft.provider_kind, kind, kind.label());
                         }
                     });
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    show_provider_fields(ui, draft);
+                });
 
                 ui.add_space(8.0);
                 ui.checkbox(&mut draft.enabled, "Enabled");
@@ -168,7 +268,7 @@ impl App {
                 ui.add_space(12.0);
                 if ui.button("Save").clicked() {
                     let mut c = config.lock().unwrap();
-                    c.model = MODELS[draft.model_idx].to_string();
+                    c.provider = draft.to_provider_config();
                     c.enabled = draft.enabled;
                     let _ = c.save();
                     draft.status = Some(("Saved.".to_string(), Instant::now()));
@@ -181,9 +281,6 @@ impl App {
                         draft.status = None;
                     }
                 }
-
-                ui.add_space(10.0);
-                ui.small("Uses your existing `claude` CLI login — no separate API key needed.");
             });
 
             if ctx.input(|i| i.viewport().close_requested()) {
@@ -275,7 +372,7 @@ impl App {
                         }
                     });
 
-                    ui.small("Powered by Claude · double-check important text");
+                    ui.small("Powered by your configured provider · double-check important text");
                 });
 
             if ctx.input(|i| i.viewport().close_requested()) {
@@ -306,6 +403,50 @@ impl App {
             }
         } else if close_clicked {
             self.popup = None;
+        }
+    }
+}
+
+/// Renders the fields specific to whichever provider is currently selected in the
+/// Settings dropdown. Each provider keeps its own draft struct so switching the dropdown
+/// mid-edit doesn't lose anything already typed into the others.
+fn show_provider_fields(ui: &mut egui::Ui, draft: &mut SettingsDraft) {
+    match draft.provider_kind {
+        ProviderKind::Local => {
+            ui.label("Base URL");
+            ui.text_edit_singleline(&mut draft.local.base_url);
+            ui.small("An OpenAI-compatible endpoint, e.g. Ollama's http://localhost:11434/v1 or LM Studio's http://localhost:1234/v1.");
+            ui.label("Model");
+            ui.text_edit_singleline(&mut draft.local.model);
+        }
+        ProviderKind::ExternalCommand => {
+            ui.label("Command");
+            ui.text_edit_singleline(&mut draft.external.command);
+            ui.label("Arguments (one per line; supports {model} {system_prompt} {schema} {prompt})");
+            ui.add(egui::TextEdit::multiline(&mut draft.external.args_text).desired_rows(6));
+
+            ui.horizontal(|ui| {
+                ui.label("Input mode:");
+                ui.selectable_value(&mut draft.external.input_mode, InputMode::Args, "Args");
+                ui.selectable_value(&mut draft.external.input_mode, InputMode::Stdin, "Stdin");
+            });
+
+            ui.label("Response path (optional; dot-path to the issue list in stdout JSON)");
+            ui.text_edit_singleline(&mut draft.external.response_path);
+            ui.label("Error path (optional; dot-path to a boolean error flag in stdout JSON)");
+            ui.text_edit_singleline(&mut draft.external.error_path);
+
+            ui.horizontal(|ui| {
+                ui.label("Model:");
+                ui.text_edit_singleline(&mut draft.external.model);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Timeout (seconds):");
+                ui.text_edit_singleline(&mut draft.external.timeout_secs);
+            });
+
+            ui.add_space(6.0);
+            ui.small("Authentication is entirely up to the command itself. The default runs the Claude Code CLI, reusing your existing `claude` login — no API key needed here.");
         }
     }
 }

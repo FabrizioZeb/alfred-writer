@@ -1,15 +1,15 @@
-//! Watches the OS-focused text field, decides when to check it with Claude, and applies
-//! corrections back. This file is the orchestrator only — the actual mechanics live in
-//! submodules by concern:
+//! Watches the OS-focused text field, decides when to check it with the configured LLM
+//! provider, and applies corrections back. This file is the orchestrator only — the
+//! actual mechanics live in submodules by concern:
 //!
 //! - `field`    — reading a UIA element (editable? password? what's its text?).
 //! - `geometry` — where on screen to put the popup.
 //! - `replace`  — turning an (original, suggestion) pair into an actual edit.
 //! - `cache`    — exact-text -> issues memoization.
 //!
-//! See ARCHITECTURE.md ("Data flow", "Extensibility seams") and SKILLS.md before changing
-//! the gating logic in `run()` below — the debounce/cooldown/single-flight/cache combo is
-//! load-bearing, not incidental.
+//! The debounce/cooldown/single-flight/cache combo in `run()` below is load-bearing, not
+//! incidental — every check may cost real time and/or money (a cloud API call or a
+//! subprocess), so it exists specifically to bound how often that happens.
 
 mod cache;
 mod field;
@@ -18,8 +18,8 @@ mod replace;
 
 pub use geometry::Rect;
 
-use crate::claude::{self, Issue};
 use crate::config::Config;
+use crate::providers::{self, CancellationHandle, CancellationToken, Issue, ProviderResponse};
 use crate::targets;
 use cache::{cache_get, cache_insert, new_cache};
 use field::{is_editable, is_password, read_text};
@@ -34,11 +34,11 @@ use std::time::{Duration, Instant};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation, IUIAutomationElement};
 
-// Each check spawns a `claude -p` subprocess (multi-second, costs real money), so we're
-// deliberately much more conservative here than a typical "check as you type" debounce:
-// wait for a longer pause, enforce a cooldown between checks on the same field, never run
-// more than one check at a time, and cache results so retyping/undoing back to a
-// previously-seen exact text is free.
+// Each check may hit a cloud API or spawn a subprocess (multi-second, possibly costs real
+// money), so we're deliberately much more conservative here than a typical "check as you
+// type" debounce: wait for a longer pause, enforce a cooldown between checks on the same
+// field, never run more than one check at a time, and cache results so retyping/undoing
+// back to a previously-seen exact text is free.
 const DEBOUNCE: Duration = Duration::from_millis(2500);
 const MIN_CHECK_INTERVAL: Duration = Duration::from_secs(6);
 const MIN_LENGTH: usize = 12;
@@ -49,11 +49,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub enum UiEvent {
     /// Hide the popup (field lost focus, text no longer needs review, etc).
     Hide,
-    /// Show a "checking…" state near `rect` while a `claude` call is in flight.
+    /// Show a "checking…" state near `rect` while a provider call is in flight.
     Loading { rect: Rect },
     /// Show flagged issues near `rect`. An empty `issues` vec is treated like `Hide`.
     Issues { rect: Rect, issues: Vec<Issue> },
-    /// Show an error message near `rect` (subprocess failure, timeout, parse failure).
+    /// Show an error message near `rect` (provider failure, timeout, parse failure).
     Error { rect: Rect, message: String },
 }
 
@@ -75,7 +75,7 @@ pub struct AutomationHandle {
 /// runs the watch → debounce → check → apply loop for the lifetime of the process.
 ///
 /// Parameters:
-/// - `config`: shared settings (model, enabled) read on every poll.
+/// - `config`: shared settings (provider, enabled) read on every poll.
 /// - `ui_tx`: channel the loop sends [`UiEvent`]s on to drive the popup.
 ///
 /// Returns:
@@ -109,6 +109,10 @@ fn run(config: Arc<Mutex<Config>>, ui_tx: Sender<UiEvent>, cmd_rx: Receiver<Auto
     let check_in_flight = Arc::new(AtomicBool::new(false));
     let issue_cache = new_cache();
     let own_pid = std::process::id() as i32;
+    // Holds the cancellation handle for whichever check is currently in flight, so a
+    // field/focus change that makes that check moot can cancel it early instead of just
+    // discarding its result once it eventually finishes.
+    let current_cancel: Arc<Mutex<Option<CancellationHandle>>> = Arc::new(Mutex::new(None));
 
     loop {
         match cmd_rx.recv_timeout(POLL_INTERVAL) {
@@ -126,7 +130,12 @@ fn run(config: Arc<Mutex<Config>>, ui_tx: Sender<UiEvent>, cmd_rx: Receiver<Auto
                 }
                 continue;
             }
-            Ok(AutomationCmd::Shutdown) => break,
+            Ok(AutomationCmd::Shutdown) => {
+                if let Some(handle) = current_cancel.lock().unwrap().take() {
+                    handle.cancel();
+                }
+                break;
+            }
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -153,6 +162,12 @@ fn run(config: Arc<Mutex<Config>>, ui_tx: Sender<UiEvent>, cmd_rx: Receiver<Auto
         };
 
         if !same_as_before {
+            // The field we were about to hear back on no longer matters — cancel rather
+            // than let it run to completion only to have its result discarded.
+            if let Some(handle) = current_cancel.lock().unwrap().take() {
+                handle.cancel();
+            }
+
             current_element = focused.clone();
             last_check_at = None;
             if popup_visible {
@@ -164,7 +179,7 @@ fn run(config: Arc<Mutex<Config>>, ui_tx: Sender<UiEvent>, cmd_rx: Receiver<Auto
             // very next poll see text != last_text and kick off a fresh debounce/check
             // cycle even when nothing had actually changed. Instead: read what's there
             // now and, if we've already checked this exact text before (cache hit),
-            // treat it as clean — no debounce, no check, no `claude` call. Only text
+            // treat it as clean — no debounce, no check, no provider call. Only text
             // we've genuinely never checked starts a debounce cycle.
             match current_element.as_ref().and_then(read_text) {
                 Some(text) => {
@@ -223,9 +238,9 @@ fn run(config: Arc<Mutex<Config>>, ui_tx: Sender<UiEvent>, cmd_rx: Receiver<Auto
         }
 
         // Gate on: long-enough pause, a cooldown since the last check on this field, and
-        // no check already running (we never let two `claude` subprocesses overlap). If
-        // any of these hold us back, `dirty` stays true so we simply retry on a later
-        // poll instead of dropping the check.
+        // no check already running (we never let two provider calls overlap). If any of
+        // these hold us back, `dirty` stays true so we simply retry on a later poll
+        // instead of dropping the check.
         let cooldown_elapsed = last_check_at.map_or(true, |t| t.elapsed() >= MIN_CHECK_INTERVAL);
         if dirty
             && last_change.elapsed() >= DEBOUNCE
@@ -249,7 +264,7 @@ fn run(config: Arc<Mutex<Config>>, ui_tx: Sender<UiEvent>, cmd_rx: Receiver<Auto
             let text_for_check = last_text.clone();
 
             // Exact-text cache hit: identical text was already checked (retyped,
-            // undone, or refocused) — skip spawning `claude` entirely.
+            // undone, or refocused) — skip calling the provider entirely.
             if let Some(cached) = cache_get(&issue_cache, &text_for_check) {
                 let valid: Vec<Issue> = cached.into_iter().filter(|i| text_for_check.contains(&i.original)).collect();
                 popup_visible = !valid.is_empty();
@@ -266,20 +281,31 @@ fn run(config: Arc<Mutex<Config>>, ui_tx: Sender<UiEvent>, cmd_rx: Receiver<Auto
 
             let gen = current_gen.fetch_add(1, Ordering::SeqCst) + 1;
             let gen_check = current_gen.clone();
-            let model = config.lock().unwrap().model.clone();
+            let provider_config = config.lock().unwrap().provider.clone();
             let ui_tx2 = ui_tx.clone();
             let in_flight = check_in_flight.clone();
             let cache_for_thread = issue_cache.clone();
             in_flight.store(true, Ordering::SeqCst);
 
+            let (cancel_token, cancel_handle) = CancellationToken::new();
+            *current_cancel.lock().unwrap() = Some(cancel_handle);
+            let cancel_for_thread = cancel_token.clone();
+
             std::thread::spawn(move || {
-                let result = claude::check_grammar(&model, &text_for_check);
+                let provider = providers::build(&provider_config);
+                let request = providers::PromptRequest {
+                    model: provider_config.model().to_string(),
+                    system_prompt: providers::default_system_prompt().to_string(),
+                    schema: providers::issue_schema(),
+                    text: text_for_check.clone(),
+                };
+                let result = provider.execute(&request, &cancel_for_thread);
                 in_flight.store(false, Ordering::SeqCst);
                 if gen_check.load(Ordering::SeqCst) != gen {
                     return; // stale, field changed again before this returned
                 }
                 match result {
-                    claude::CheckResult::Issues(issues) => {
+                    ProviderResponse::Issues(issues) => {
                         cache_insert(&cache_for_thread, text_for_check.clone(), issues.clone());
                         let valid: Vec<Issue> = issues
                             .into_iter()
@@ -287,9 +313,10 @@ fn run(config: Arc<Mutex<Config>>, ui_tx: Sender<UiEvent>, cmd_rx: Receiver<Auto
                             .collect();
                         let _ = ui_tx2.send(UiEvent::Issues { rect, issues: valid });
                     }
-                    claude::CheckResult::Error(message) => {
+                    ProviderResponse::Error(message) => {
                         let _ = ui_tx2.send(UiEvent::Error { rect, message });
                     }
+                    ProviderResponse::Cancelled => {}
                 }
             });
         }
