@@ -13,6 +13,11 @@ pub struct Config {
     /// Global on/off toggle for checking, mirrored in the tray menu.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Apps to never check: executable basenames, case-insensitive, `.exe` optional
+    /// (e.g. `keepass`, `1Password.exe`). Consulted live on every poll, so edits apply
+    /// without restarting — see [`crate::targets::classify`] for matching rules.
+    #[serde(default)]
+    pub blacklist: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -24,6 +29,7 @@ impl Default for Config {
         Self {
             provider: ProviderConfig::default(),
             enabled: true,
+            blacklist: Vec::new(),
         }
     }
 }
@@ -92,8 +98,10 @@ mod tests {
             provider: ProviderConfig::Local(LocalConfig {
                 base_url: "http://localhost:11434/v1".to_string(),
                 model: "llama3.1".to_string(),
+                timeout_secs: 180,
             }),
             enabled: false,
+            blacklist: vec!["keepass.exe".to_string()],
         };
         let bytes = serde_json::to_vec(&c).unwrap();
         let back: Config = serde_json::from_slice(&bytes).unwrap();

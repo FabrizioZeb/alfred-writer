@@ -1,5 +1,10 @@
 /target
 
+# Local machine-specific config backups (e.g. scripts/claude-default.local.json)
+scripts/*.local.json
+
 ARCHITECTURE.md
 SKILLS.md
 .claude/
+
+**/*.env

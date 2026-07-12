@@ -1,0 +1,50 @@
+// Tails Alfred Writer's telemetry JSONL (bind-mounted at /telemetry) and pushes each
+// line into Loki. Labels are kept low-cardinality on purpose (outcome/cache_path/
+// provider are small enums); everything else stays in the JSON body and is queried
+// with LogQL's `| json` at read time.
+
+local.file_match "telemetry" {
+	path_targets = [{
+		__path__ = "/telemetry/*.jsonl",
+		job      = "alfred-writer",
+	}]
+}
+
+loki.source.file "telemetry" {
+	targets    = local.file_match.telemetry.targets
+	forward_to = [loki.process.telemetry.receiver]
+}
+
+loki.process "telemetry" {
+	stage.json {
+		expressions = {
+			ts_ms      = "ts_ms",
+			outcome    = "outcome",
+			cache_path = "cache_path",
+			provider   = "provider",
+		}
+	}
+
+	stage.labels {
+		values = {
+			outcome    = "",
+			cache_path = "",
+			provider   = "",
+		}
+	}
+
+	// Use the app's own timestamp, not the ship time, so backfilled/old lines land
+	// where they actually happened.
+	stage.timestamp {
+		source = "ts_ms"
+		format = "UnixMs"
+	}
+
+	forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}

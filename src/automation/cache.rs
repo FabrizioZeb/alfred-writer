@@ -2,12 +2,20 @@
 //! already checked never spawns another `claude` subprocess. See the cache row in the
 //! "Performance/cost architecture" table in ARCHITECTURE.md — this is one of four gates
 //! that exist together on purpose; don't remove it in isolation.
+//!
+//! Keys are cached at two granularities in the same map: the whole field text (so a
+//! refocus/undo to a previously-seen state is free), and each individual paragraph (so
+//! appending one sentence to a long email only re-checks the paragraph that changed, not
+//! the whole document). Both are just exact-text keys — a single-paragraph field
+//! naturally uses one entry for both roles.
 
 use crate::providers::Issue;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-const CACHE_CAP: usize = 40;
+// Sized for paragraph-granularity keys: a handful of long documents' worth of paragraphs
+// plus whole-text keys. Entries are small (short issue lists), so this is still tiny.
+const CACHE_CAP: usize = 200;
 
 pub(super) type IssueCache = Arc<Mutex<(HashMap<String, Vec<Issue>>, VecDeque<String>)>>;
 
@@ -38,6 +46,19 @@ pub(super) fn cache_insert(cache: &IssueCache, key: String, issues: Vec<Issue>) 
         }
     }
     guard.0.insert(key, issues);
+}
+
+/// Splits field text into the per-paragraph cache keys. UIA text contains hard newlines
+/// only where the user actually pressed Enter, so line boundaries are the natural "this
+/// part didn't change" unit. Whitespace-only lines are skipped; each returned segment is
+/// a verbatim (trimmed-of-`\r`) substring of `text`, which is what lets per-segment
+/// issues be re-validated later with a plain `contains` check.
+pub(super) fn segments(text: &str) -> Vec<String> {
+    text.split('\n')
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -91,6 +112,29 @@ mod tests {
             cache_insert(&cache, format!("k{i}"), vec![]);
         }
         assert!(cache_get(&cache, "a").is_some(), "\"a\" should not have been evicted");
+    }
+
+    #[test]
+    fn segments_split_on_newlines_and_skip_blank_lines() {
+        let text = "First paragraph here.\r\n\r\nSecond one.\n   \nThird.";
+        let segs = segments(text);
+        assert_eq!(segs, vec!["First paragraph here.", "Second one.", "Third."]);
+    }
+
+    #[test]
+    fn segments_of_single_line_text_is_that_line() {
+        assert_eq!(segments("just one line"), vec!["just one line"]);
+        assert!(segments("   \n \r\n").is_empty());
+    }
+
+    #[test]
+    fn every_segment_is_a_verbatim_substring_of_the_input() {
+        // The merge path re-validates cached issues with `text.contains(&issue.original)`,
+        // which is only sound if segments really are verbatim substrings.
+        let text = "alpha beta\r\ngamma delta\n\nepsilon";
+        for seg in segments(text) {
+            assert!(text.contains(&seg), "segment {seg:?} must appear verbatim in the input");
+        }
     }
 
     #[test]

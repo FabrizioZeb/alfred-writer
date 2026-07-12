@@ -147,7 +147,7 @@ impl LlmProvider for ExternalCommandProvider {
         command
             .args(&args)
             .envs(self.config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .current_dir(std::env::temp_dir())
+            .current_dir(stable_working_dir())
             .stdin(stdin_cfg)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -248,6 +248,22 @@ impl LlmProvider for ExternalCommandProvider {
         // no channel back to us to report rate-limit state.
         None
     }
+}
+
+/// The child's working directory must be *stable and unchanging* between checks, not just
+/// writable. This used to be `std::env::temp_dir()`, which cost real latency and tokens:
+/// CLIs that fold workspace state into a prompt-cached prefix (Claude Code does) saw a
+/// different %TEMP% snapshot on every check, invalidating ~2.6k tokens of cache per call —
+/// measured as `cache_creation_input_tokens` ≈ 2600 on every invocation from %TEMP%,
+/// versus 0 (fully cached prefix) from a dedicated empty directory that never changes.
+fn stable_working_dir() -> std::path::PathBuf {
+    if let Some(dirs) = directories::ProjectDirs::from("dev", "local", "AlfredWriter") {
+        let dir = dirs.data_local_dir().join("cli-cwd");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return dir;
+        }
+    }
+    std::env::temp_dir()
 }
 
 fn substitute_args(template: &[String], request: &PromptRequest) -> Vec<String> {
@@ -428,6 +444,16 @@ mod tests {
         );
         // The output isn't JSON, so this is expected to be an Error, not a hang or crash.
         assert!(matches!(result, ProviderResponse::Error(_)));
+    }
+
+    #[test]
+    fn stable_working_dir_exists_and_is_not_the_volatile_temp_dir() {
+        let dir = stable_working_dir();
+        assert!(dir.exists(), "working dir should be created on demand");
+        // %TEMP%'s contents churn constantly, which invalidates prompt-cached workspace
+        // context in CLIs like Claude Code — the whole point of this function is to not
+        // end up there in the normal case.
+        assert_ne!(dir, std::env::temp_dir());
     }
 
     #[test]

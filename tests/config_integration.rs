@@ -31,8 +31,10 @@ fn save_load_and_corrupted_file_recovery_against_the_real_filesystem() {
         provider: ProviderConfig::Local(LocalConfig {
             base_url: "http://localhost:11434/v1".to_string(),
             model: "llama3.1".to_string(),
+            timeout_secs: 180,
         }),
         enabled: false,
+        blacklist: vec!["keepass.exe".to_string()],
     };
     to_save.save().expect("save should succeed against a writable scratch dir");
 

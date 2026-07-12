@@ -1,0 +1,89 @@
+{
+  "uid": "alfred-writer-checks",
+  "title": "Alfred Writer — Grammar Checks",
+  "tags": ["alfred-writer"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Provider latency (p50 / p95, ms)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "loki", "uid": "alfred-loki" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "quantile_over_time(0.5, {job=\"alfred-writer\", cache_path=\"provider\"} | json | unwrap provider_ms [$__auto])",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "quantile_over_time(0.95, {job=\"alfred-writer\", cache_path=\"provider\"} | json | unwrap provider_ms [$__auto])",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Checks by cache path (per 5m)",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "loki", "uid": "alfred-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cache_path) (count_over_time({job=\"alfred-writer\"}[5m]))",
+          "legendFormat": "{{cache_path}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Outcomes (per 5m)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "loki", "uid": "alfred-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (count_over_time({job=\"alfred-writer\"}[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Paragraphs sent vs cached (avg per check)",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "loki", "uid": "alfred-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg_over_time({job=\"alfred-writer\"} | json | unwrap segments_sent [$__auto])",
+          "legendFormat": "sent to provider"
+        },
+        {
+          "refId": "B",
+          "expr": "avg_over_time({job=\"alfred-writer\"} | json | unwrap segments_cached [$__auto])",
+          "legendFormat": "served from cache"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "logs",
+      "title": "Raw check records",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 18 },
+      "datasource": { "type": "loki", "uid": "alfred-loki" },
+      "options": { "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true },
+      "targets": [
+        { "refId": "A", "expr": "{job=\"alfred-writer\"}" }
+      ]
+    }
+  ]
+}
