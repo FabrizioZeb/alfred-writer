@@ -50,15 +50,35 @@ static PROCESS_NAME_CACHE: Mutex<Option<HashMap<i32, String>>> = Mutex::new(None
 ///
 /// Parameters:
 /// - `pid`: OS process id of the focused UIA element's owning process.
+/// - `blacklist`: user-configured app names to never check (from Settings). Entries are
+///   executable basenames, case-insensitive, `.exe` optional (`KeePass` == `keepass.exe`).
+///   Read from live config on every poll, so edits apply without a restart.
 ///
 /// Returns:
-/// [`Policy::Skip`] for known terminal emulators, [`Policy::Standard`] otherwise
-/// (including when the process name can't be looked up at all).
-pub fn classify(pid: i32) -> Policy {
+/// [`Policy::Skip`] for known terminal emulators and blacklisted apps,
+/// [`Policy::Standard`] otherwise (including when the process name can't be looked up).
+///
+/// Identification is deliberately by executable *basename*, not full path or window
+/// class: paths vary per machine/install and break the moment an app updates in place,
+/// window classes are undocumented implementation details that churn across app versions
+/// (and are all identical for UWP hosts), while the basename is what users can actually
+/// discover themselves in Task Manager. The cost is that two different apps sharing a
+/// basename are indistinguishable — acceptable for an opt-out list.
+pub fn classify(pid: i32, blacklist: &[String]) -> Policy {
     match process_executable_name(pid) {
-        Some(name) if is_terminal_executable(&name) => Policy::Skip,
+        Some(name) if is_terminal_executable(&name) || is_blacklisted(&name, blacklist) => Policy::Skip,
         _ => Policy::Standard,
     }
+}
+
+/// Whether the (pre-lowercased) executable basename matches any user blacklist entry.
+/// Entries match case-insensitively, with or without a trailing `.exe`.
+fn is_blacklisted(name: &str, blacklist: &[String]) -> bool {
+    let stem = name.strip_suffix(".exe").unwrap_or(name);
+    blacklist.iter().any(|entry| {
+        let entry = entry.trim().to_lowercase();
+        !entry.is_empty() && entry.strip_suffix(".exe").unwrap_or(&entry) == stem
+    })
 }
 
 /// Pure name-matching logic split out from `classify` so it's testable without a real
@@ -128,6 +148,22 @@ mod tests {
     fn unknown_pid_classifies_as_standard() {
         // No process should ever plausibly have this pid, so process_executable_name
         // returns None and classify() falls back to Standard.
-        assert_eq!(classify(-1), Policy::Standard);
+        assert_eq!(classify(-1, &[]), Policy::Standard);
+    }
+
+    #[test]
+    fn blacklist_matches_case_insensitively_with_or_without_exe() {
+        let blacklist = vec!["KeePass".to_string(), "1password.exe".to_string(), "  Code.EXE  ".to_string()];
+        for name in ["keepass.exe", "1password.exe", "code.exe"] {
+            assert!(is_blacklisted(name, &blacklist), "{name} should be blacklisted");
+        }
+        assert!(!is_blacklisted("notepad.exe", &blacklist));
+    }
+
+    #[test]
+    fn empty_blacklist_entries_never_match() {
+        // A stray blank line in the Settings textarea must not blacklist everything.
+        let blacklist = vec!["".to_string(), "   ".to_string(), ".exe".to_string()];
+        assert!(!is_blacklisted("chrome.exe", &blacklist));
     }
 }

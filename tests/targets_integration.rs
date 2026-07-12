@@ -9,12 +9,22 @@ fn current_test_process_is_not_classified_as_a_terminal() {
     // The test binary itself is some cargo-generated *.exe, never one of the terminal
     // emulator executables, so this should resolve through the real OS lookup to Standard.
     let pid = std::process::id() as i32;
-    assert_eq!(classify(pid), Policy::Standard);
+    assert_eq!(classify(pid, &[]), Policy::Standard);
+}
+
+#[test]
+fn blacklisting_the_current_process_by_name_skips_it() {
+    // End-to-end through the real OS lookup: resolve our own exe name, blacklist it
+    // (uppercased and without .exe, to exercise normalization), and expect Skip.
+    let pid = std::process::id() as i32;
+    let exe = std::env::current_exe().unwrap();
+    let stem = exe.file_stem().unwrap().to_string_lossy().to_uppercase();
+    assert_eq!(classify(pid, &[stem]), Policy::Skip);
 }
 
 #[test]
 fn nonexistent_pid_falls_back_to_standard() {
     // No process can plausibly have this pid, so OpenProcess fails, the name lookup
     // returns None, and classify() must not panic — it should default to Standard.
-    assert_eq!(classify(i32::MAX), Policy::Standard);
+    assert_eq!(classify(i32::MAX, &[]), Policy::Standard);
 }

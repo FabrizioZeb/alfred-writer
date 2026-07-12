@@ -1,4 +1,4 @@
-use crate::automation::{AutomationCmd, Rect, UiEvent};
+use crate::automation::{place_popup, AutomationCmd, Rect, UiEvent};
 use crate::config::Config;
 use crate::providers::{ExternalCommandConfig, InputMode, Issue, LocalConfig, ProviderConfig};
 use crate::theme;
@@ -9,10 +9,42 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Title of the suggestion popup/indicator window. Never user-visible (decorations are
+/// off and it's excluded from the taskbar) — it exists so [`apply_noactivate`] can find
+/// this specific HWND by exact title without ever matching the hidden root window or the
+/// Settings window, which both start with "Alfred Writer" too.
+const POPUP_TITLE: &str = "Alfred Writer — Suggestions";
+
+/// Stamps `WS_EX_NOACTIVATE` onto the popup window so it never takes keyboard focus:
+/// the user keeps typing in their field while hovering, scrolling, or clicking Apply.
+/// Mouse input still arrives normally — only *activation* is suppressed.
+///
+/// Called every frame the popup is shown (cheap: one FindWindowW + a read), not just
+/// once, because egui recreates the OS window whenever the viewport builder changes
+/// (e.g. the popup resizes between indicator/loading/issues states), which would drop a
+/// style applied only at first creation.
+fn apply_noactivate(title: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    };
+    unsafe {
+        let Ok(hwnd) = FindWindowW(None, &HSTRING::from(title)) else {
+            return;
+        };
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let no_activate = WS_EX_NOACTIVATE.0 as isize;
+        if ex & no_activate == 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | no_activate);
+        }
+    }
+}
+
 #[derive(Clone)]
 enum PopupState {
-    Loading { rect: Rect },
-    Issues { rect: Rect, issues: Vec<Issue> },
+    /// `spans[i]` = on-screen rects of `issues[i]`'s flagged text (empty when the span
+    /// couldn't be located), used to draw clickable underlines beneath the text itself.
+    Issues { rect: Rect, issues: Vec<Issue>, spans: Vec<Vec<Rect>> },
     Error { rect: Rect, message: String },
 }
 
@@ -106,6 +138,9 @@ struct SettingsDraft {
     local: LocalConfig,
     external: ExternalCommandDraft,
     enabled: bool,
+    /// One executable name per line (case-insensitive, `.exe` optional) — apps where
+    /// checking is disabled entirely.
+    blacklist_text: String,
     status: Option<(String, Instant)>,
 }
 
@@ -116,6 +151,7 @@ impl SettingsDraft {
             local: LocalConfig::default(),
             external: ExternalCommandDraft::from(&ExternalCommandConfig::default()),
             enabled: config.enabled,
+            blacklist_text: config.blacklist.join("\n"),
             status: None,
         };
         match &config.provider {
@@ -140,6 +176,20 @@ pub struct App {
     automation_cmd_tx: Sender<AutomationCmd>,
     quit: Arc<AtomicBool>,
     popup: Option<PopupState>,
+    /// Local-provider mode only: issues arrived but the popup is showing as a small
+    /// count badge near the caret instead of the full suggestion list. Hovering or
+    /// clicking the badge expands it (Grammarly-style: analysis is decoupled from
+    /// presentation, so frequent cheap local checks don't shove a full popup at the
+    /// user every couple of seconds).
+    indicator_collapsed: bool,
+    /// When set, the expanded popup shows only this issue (index into the current
+    /// `PopupState::Issues` list) — the state after clicking that issue's underline.
+    selected_issue: Option<usize>,
+    /// One-shot: (re)pin the popup window's position on the next frame it's shown.
+    /// Cleared after applying so the user can drag the popup wherever they like without
+    /// it snapping back; set again whenever the anchor meaningfully changes (new result,
+    /// underline click, badge expand, error).
+    reposition_popup: bool,
     show_settings: bool,
     settings_open_request: bool,
     draft: SettingsDraft,
@@ -171,6 +221,9 @@ impl App {
             automation_cmd_tx,
             quit,
             popup: None,
+            indicator_collapsed: false,
+            selected_issue: None,
+            reposition_popup: false,
             show_settings: false,
             settings_open_request: false,
             draft,
@@ -188,16 +241,29 @@ impl eframe::App for App {
 
         while let Ok(ev) = self.ui_rx.try_recv() {
             match ev {
-                UiEvent::Hide => self.popup = None,
-                UiEvent::Loading { rect } => self.popup = Some(PopupState::Loading { rect }),
-                UiEvent::Issues { rect, issues } => {
+                UiEvent::Hide => {
+                    self.popup = None;
+                    self.selected_issue = None;
+                }
+                // Analysis is invisible by design (Grammarly-style strict separation of
+                // analysis from presentation): no "checking…" popup while the user
+                // types. A result only ever surfaces as underlines (or the badge).
+                UiEvent::Loading { .. } => {}
+                UiEvent::Issues { rect, issues, spans } => {
                     if issues.is_empty() {
                         self.popup = None;
+                        self.selected_issue = None;
                     } else {
-                        self.popup = Some(PopupState::Issues { rect, issues });
+                        self.indicator_collapsed = true;
+                        self.selected_issue = None;
+                        self.reposition_popup = true;
+                        self.popup = Some(PopupState::Issues { rect, issues, spans });
                     }
                 }
-                UiEvent::Error { rect, message } => self.popup = Some(PopupState::Error { rect, message }),
+                UiEvent::Error { rect, message } => {
+                    self.reposition_popup = true;
+                    self.popup = Some(PopupState::Error { rect, message });
+                }
             }
         }
 
@@ -222,6 +288,19 @@ impl eframe::App for App {
 
         if self.show_settings {
             self.show_settings_window(ctx);
+        }
+
+        // Underline strips stay visible for as long as issues exist (collapsed or
+        // expanded); clicking one selects that issue and opens the popup at the click.
+        if let Some(PopupState::Issues { spans, .. }) = self.popup.clone() {
+            if let Some((idx, anchor)) = self.show_underline_strips(ctx, &spans) {
+                self.indicator_collapsed = false;
+                self.selected_issue = Some(idx);
+                self.reposition_popup = true;
+                if let Some(PopupState::Issues { rect, .. }) = &mut self.popup {
+                    *rect = anchor;
+                }
+            }
         }
 
         if let Some(popup) = self.popup.clone() {
@@ -296,6 +375,11 @@ impl App {
                     ui.add_space(10.0);
                     ui.checkbox(&mut draft.enabled, egui::RichText::new("Enabled").strong());
 
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Disabled applications").strong().color(theme::SLATE));
+                    ui.small("One program per line, as shown in Task Manager — e.g. keepass, 1Password.exe. Checking is fully off inside these apps. Takes effect on Save, no restart needed.");
+                    ui.add(egui::TextEdit::multiline(&mut draft.blacklist_text).desired_rows(3).desired_width(f32::INFINITY));
+
                     ui.add_space(12.0);
                     let save_button = egui::Button::new(egui::RichText::new("Save").strong().color(egui::Color32::WHITE))
                         .fill(theme::MAGENTA);
@@ -303,6 +387,13 @@ impl App {
                         let mut c = config.lock().unwrap();
                         c.provider = draft.to_provider_config();
                         c.enabled = draft.enabled;
+                        c.blacklist = draft
+                            .blacklist_text
+                            .lines()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect();
                         let _ = c.save();
                         draft.status = Some(("Saved.".to_string(), Instant::now()));
                     }
@@ -330,57 +421,181 @@ impl App {
         }
     }
 
-    fn show_popup_window(&mut self, ctx: &egui::Context, popup: &PopupState) {
-        let rect = match popup {
-            PopupState::Loading { rect } => *rect,
-            PopupState::Issues { rect, .. } => *rect,
-            PopupState::Error { rect, .. } => *rect,
-        };
+    /// Draws one thin, always-on-top, non-activating strip right beneath each flagged
+    /// span — the inline "underline" that marks where an issue is without covering any
+    /// text or taking focus. Only the few pixels of the strip itself are clickable; the
+    /// text above it still belongs entirely to the edited app.
+    ///
+    /// Returns `Some((issue_index, span_rect))` when a strip was clicked this frame.
+    fn show_underline_strips(&mut self, ctx: &egui::Context, spans: &[Vec<Rect>]) -> Option<(usize, Rect)> {
+        // Bound the number of OS windows a pathological result can spawn.
+        const MAX_STRIPS: usize = 12;
+        const STRIP_HEIGHT: f32 = 4.0;
 
-        let body_height: f32 = match popup {
-            PopupState::Loading { .. } => 44.0,
-            PopupState::Error { .. } => 64.0,
-            PopupState::Issues { issues, .. } => (issues.len() as f32 * 104.0).clamp(64.0, 320.0),
-        };
-        let window_height = 76.0 + body_height;
+        let mut clicked = None;
+        let mut shown = 0usize;
+        'outer: for (issue_idx, rects) in spans.iter().enumerate() {
+            for (line_idx, r) in rects.iter().enumerate() {
+                if shown == MAX_STRIPS {
+                    break 'outer;
+                }
+                shown += 1;
+                let width = (r.right - r.left).max(10.0);
+                // Unique title per strip so apply_noactivate can find each HWND.
+                let title = format!("AW underline {issue_idx}.{line_idx}");
+                let id = egui::ViewportId::from_hash_of(("aw-underline", issue_idx, line_idx));
+                let builder = egui::ViewportBuilder::default()
+                    .with_title(&title)
+                    .with_inner_size([width, STRIP_HEIGHT])
+                    .with_position(egui::pos2(r.left, r.bottom))
+                    .with_decorations(false)
+                    .with_always_on_top()
+                    .with_resizable(false)
+                    .with_transparent(true)
+                    .with_active(false)
+                    .with_taskbar(false);
 
+                let mut hit = false;
+                ctx.show_viewport_immediate(id, builder, |ctx, _class| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none().fill(theme::DANGER))
+                        .show(ctx, |ui| {
+                            let response = ui.interact(ui.max_rect(), ui.id().with("strip"), egui::Sense::click());
+                            if response.clicked() {
+                                hit = true;
+                            }
+                        });
+                });
+                apply_noactivate(&title);
+                if hit {
+                    clicked = Some((issue_idx, *r));
+                }
+            }
+        }
+        clicked
+    }
+
+    /// Collapsed form of the issues popup: a small always-on-top count badge near the
+    /// caret. Hovering or clicking it expands into the full popup. Reuses the popup's
+    /// viewport id so expanding is a resize of the same OS window, not a new one.
+    fn show_indicator(&mut self, ctx: &egui::Context, rect: Rect, count: usize) {
         let id = egui::ViewportId::from_hash_of("alfred-writer-popup");
+        let (px, py) = place_popup(&rect, 52.0, 32.0);
         let builder = egui::ViewportBuilder::default()
-            .with_title("Alfred Writer")
-            .with_inner_size([320.0, window_height])
-            .with_position(egui::pos2(rect.left, rect.bottom + 6.0))
+            .with_title(POPUP_TITLE)
+            .with_inner_size([52.0, 32.0])
+            .with_position(egui::pos2(px, py))
             .with_decorations(false)
             .with_always_on_top()
             .with_resizable(false)
             .with_transparent(true)
+            .with_active(false)
             .with_taskbar(false);
 
-        let mut close_clicked = false;
-        let mut apply_click: Option<(usize, String, String)> = None;
-        let mut dismiss_click: Option<usize> = None;
-
+        let mut expand = false;
         ctx.show_viewport_immediate(id, builder, |ctx, _class| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::WHITE))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        theme::draw_badge(ui, 20.0);
-                        ui.label(egui::RichText::new("Alfred Writer").strong().color(theme::SLATE));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::close_button(ui, 18.0).clicked() {
-                                close_clicked = true;
-                            }
-                        });
+                        theme::draw_badge(ui, 16.0);
+                        ui.label(egui::RichText::new(count.to_string()).strong().color(theme::SLATE));
                     });
+                    let response = ui.interact(ui.max_rect(), ui.id().with("indicator"), egui::Sense::click());
+                    if response.hovered() || response.clicked() {
+                        expand = true;
+                    }
+                });
+        });
+        apply_noactivate(POPUP_TITLE);
+        if expand {
+            self.indicator_collapsed = false;
+            self.reposition_popup = true;
+        }
+    }
+
+    fn show_popup_window(&mut self, ctx: &egui::Context, popup: &PopupState) {
+        if self.indicator_collapsed {
+            if let PopupState::Issues { rect, issues, spans } = popup {
+                // Underlines are the indicator whenever at least one span resolved to a
+                // screen position; the count badge is only the fallback for controls
+                // where no span could be located.
+                if spans.iter().all(|s| s.is_empty()) {
+                    self.show_indicator(ctx, *rect, issues.len());
+                }
+                return;
+            }
+        }
+
+        let rect = match popup {
+            PopupState::Issues { rect, .. } => *rect,
+            PopupState::Error { rect, .. } => *rect,
+        };
+
+        // Which issues this popup shows: just the one whose underline was clicked, or
+        // all of them (badge expand / "show all").
+        let display: Vec<(usize, &Issue)> = match (popup, self.selected_issue) {
+            (PopupState::Issues { issues, .. }, Some(sel)) if sel < issues.len() => {
+                vec![(sel, &issues[sel])]
+            }
+            (PopupState::Issues { issues, .. }, _) => issues.iter().enumerate().collect(),
+            _ => Vec::new(),
+        };
+
+        let body_height: f32 = match popup {
+            PopupState::Error { .. } => 64.0,
+            PopupState::Issues { .. } => (display.len() as f32 * 104.0).clamp(64.0, 320.0),
+        };
+        let window_height = 76.0 + body_height;
+
+        let id = egui::ViewportId::from_hash_of("alfred-writer-popup");
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(POPUP_TITLE)
+            .with_inner_size([320.0, window_height])
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_resizable(false)
+            .with_transparent(true)
+            .with_active(false)
+            .with_taskbar(false);
+        // Pin the position only when the anchor changed; otherwise leave the window
+        // wherever it is so a user drag isn't snapped back next frame.
+        if self.reposition_popup {
+            let (px, py) = place_popup(&rect, 320.0, window_height);
+            builder = builder.with_position(egui::pos2(px, py));
+            self.reposition_popup = false;
+        }
+
+        let mut close_clicked = false;
+        let mut apply_click: Option<(usize, String, String)> = None;
+        let mut dismiss_click: Option<usize> = None;
+        let mut show_all_clicked = false;
+
+        ctx.show_viewport_immediate(id, builder, |ctx, _class| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::WHITE))
+                .show(ctx, |ui| {
+                    // The header doubles as the drag handle (the window has no OS title
+                    // bar) — grab it to move the popup anywhere; it stays put because
+                    // position is only re-pinned when the anchor changes.
+                    let header_response = ui
+                        .horizontal(|ui| {
+                            theme::draw_badge(ui, 20.0);
+                            ui.label(egui::RichText::new("Alfred Writer").strong().color(theme::SLATE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if theme::close_button(ui, 18.0).clicked() {
+                                    close_clicked = true;
+                                }
+                            });
+                        })
+                        .response
+                        .interact(egui::Sense::drag());
+                    if header_response.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
                     ui.separator();
 
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| match popup {
-                        PopupState::Loading { .. } => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(egui::RichText::new("Checking your writing…").strong().color(theme::SLATE));
-                            });
-                        }
                         PopupState::Error { message, .. } => {
                             egui::Frame::none()
                                 .fill(theme::DANGER_TINT)
@@ -394,7 +609,7 @@ impl App {
                                 });
                         }
                         PopupState::Issues { issues, .. } => {
-                            for (i, issue) in issues.iter().enumerate() {
+                            for &(i, issue) in &display {
                                 // Unique ID salt per row — without this, every issue's
                                 // widgets (Apply/Dismiss buttons) share the same
                                 // auto-generated egui ID (same call site each loop turn),
@@ -434,6 +649,14 @@ impl App {
                                     ui.add_space(6.0);
                                 });
                             }
+                            // Single-issue view (opened from an underline): offer the
+                            // rest without making the user hunt for other underlines.
+                            if display.len() == 1 && issues.len() > 1 {
+                                let label = format!("Show all {} suggestions", issues.len());
+                                if ui.button(egui::RichText::new(label).color(theme::MUTED)).clicked() {
+                                    show_all_clicked = true;
+                                }
+                            }
                         }
                     });
 
@@ -445,30 +668,37 @@ impl App {
                 close_clicked = true;
             }
         });
+        apply_noactivate(POPUP_TITLE);
 
         if let Some((idx, original, suggestion)) = apply_click {
             let _ = self.automation_cmd_tx.send(AutomationCmd::Apply { original, suggestion });
-            if let Some(PopupState::Issues { issues, rect }) = self.popup.take() {
-                let mut issues = issues;
-                issues.remove(idx);
-                self.popup = if issues.is_empty() {
-                    None
-                } else {
-                    Some(PopupState::Issues { rect, issues })
-                };
-            }
+            self.remove_issue(idx);
         } else if let Some(idx) = dismiss_click {
-            if let Some(PopupState::Issues { issues, rect }) = self.popup.take() {
-                let mut issues = issues;
-                issues.remove(idx);
-                self.popup = if issues.is_empty() {
-                    None
-                } else {
-                    Some(PopupState::Issues { rect, issues })
-                };
-            }
+            self.remove_issue(idx);
+        } else if show_all_clicked {
+            self.selected_issue = None;
         } else if close_clicked {
             self.popup = None;
+            self.selected_issue = None;
+        }
+    }
+
+    /// Drops issue `idx` (and its underline spans) after Apply/Dismiss, closing the
+    /// popup entirely when it was the last one.
+    fn remove_issue(&mut self, idx: usize) {
+        self.selected_issue = None;
+        if let Some(PopupState::Issues { mut issues, mut spans, rect }) = self.popup.take() {
+            if idx < issues.len() {
+                issues.remove(idx);
+            }
+            if idx < spans.len() {
+                spans.remove(idx);
+            }
+            self.popup = if issues.is_empty() {
+                None
+            } else {
+                Some(PopupState::Issues { rect, issues, spans })
+            };
         }
     }
 }

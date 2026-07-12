@@ -1,0 +1,52 @@
+# Local log-viewer stack for Alfred Writer's telemetry JSONL.
+#
+# The app itself CANNOT run in Docker (it's a Win32 GUI hooking UI Automation); it writes
+# metrics to %LOCALAPPDATA%\AlfredWriter\data\telemetry\checks.jsonl on the host, and this
+# stack tails that file: Alloy ships it into Loki, Grafana visualizes it.
+#
+#   cd docker
+#   docker compose up -d
+#   start http://localhost:3000     (anonymous admin, local-only convenience)
+#
+# TELEMETRY_DIR comes from ./.env — point it at your telemetry folder.
+
+services:
+  loki:
+    image: grafana/loki:3.4.1
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+
+  alloy:
+    image: grafana/alloy:v1.8.1
+    command: run --storage.path=/var/lib/alloy/data /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Host telemetry dir, mounted read-only where config.alloy expects it.
+      - ${TELEMETRY_DIR}:/telemetry:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    ports:
+      - "3000:3000"
+    environment:
+      # Local single-user stack: skip the login screen entirely.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - loki
+
+volumes:
+  loki-data:
+  alloy-data:
+  grafana-data:

@@ -193,6 +193,16 @@ impl ProviderConfig {
         ProviderConfig::ExternalCommand(ExternalCommandConfig::claude_code_preset())
     }
 
+    /// Same stable id the built provider's [`LlmProvider::id`] would report, available
+    /// without constructing the provider (used for telemetry on cache-hit paths where no
+    /// provider is ever built).
+    pub fn id(&self) -> &'static str {
+        match self {
+            ProviderConfig::Local(_) => "local",
+            ProviderConfig::ExternalCommand(_) => "external-command",
+        }
+    }
+
     pub fn model(&self) -> &str {
         match self {
             ProviderConfig::Local(c) => &c.model,
@@ -236,6 +246,7 @@ mod tests {
         let local = ProviderConfig::Local(LocalConfig {
             base_url: "http://localhost:11434/v1".to_string(),
             model: "llama3.1".to_string(),
+            timeout_secs: 180,
         });
         assert_eq!(local.model(), "llama3.1");
         assert_eq!(local.label(), "Local (Ollama / LM Studio)");

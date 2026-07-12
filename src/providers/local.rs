@@ -1,15 +1,25 @@
 //! Local model server provider — Ollama, LM Studio, or anything else exposing an
 //! OpenAI-compatible `/chat/completions` endpoint on localhost. No API key required.
-//! Structured output isn't reliably enforceable across arbitrary local runtimes, so
-//! rather than relying on a schema-constrained response format, the schema is embedded
-//! as instructions in the system prompt and we ask for `json_object` mode as a
-//! best-effort nudge toward valid JSON.
+//!
+//! No `response_format` is sent at all; the schema is embedded as instructions in the
+//! system prompt and the reply is cleaned up before parsing. Both constrained modes
+//! were tried against a real LM Studio (0.3.x, Qwen3.5-9B) and failed in different
+//! ways: `json_object` is rejected outright ("'response_format.type' must be
+//! 'json_schema' or 'text'"), and `json_schema` hangs indefinitely on thinking models
+//! (grammar-constrained sampling deadlocks against the reasoning channel — a 5-minute
+//! wall-clock test never returned). Plain prompting returned clean, parseable JSON.
 
 use super::{CancellationToken, IssueList, LlmProvider, ProviderCapabilities, ProviderResponse, PromptRequest, RateLimitInfo};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Generous because local models can be slow in ways cloud APIs never are: thinking
+/// models (e.g. Qwen3.5) spend 1k+ mandatory reasoning tokens per reply, and a first
+/// request may also pay a cold model load. Measured: ~80s for one grammar check on
+/// Qwen3.5-9B Q8 at ~16 tok/s. Overridable per-config via `timeout_secs`.
+fn default_timeout_secs() -> u64 {
+    180
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocalConfig {
@@ -17,6 +27,8 @@ pub struct LocalConfig {
     /// `http://localhost:11434/v1` or LM Studio's `http://localhost:1234/v1`.
     pub base_url: String,
     pub model: String,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 impl Default for LocalConfig {
@@ -24,6 +36,7 @@ impl Default for LocalConfig {
         Self {
             base_url: "http://localhost:11434/v1".to_string(),
             model: "llama3.1".to_string(),
+            timeout_secs: default_timeout_secs(),
         }
     }
 }
@@ -63,18 +76,19 @@ impl LlmProvider for LocalProvider {
             request.system_prompt, request.schema
         );
 
+        // Deliberately no `response_format` — see module docs for why both constrained
+        // modes fail against real local runtimes.
         let body = serde_json::json!({
             "model": request.model,
             "messages": [
                 { "role": "system", "content": system_prompt },
                 { "role": "user", "content": request.text },
             ],
-            "response_format": { "type": "json_object" },
         });
 
         let result = ureq::post(&url)
             .set("content-type", "application/json")
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(Duration::from_secs(self.config.timeout_secs))
             .send_json(body);
 
         match result {
@@ -108,10 +122,29 @@ fn extract_issues(value: &serde_json::Value) -> ProviderResponse {
     else {
         return ProviderResponse::Error("Local model response had no message content.".to_string());
     };
-    match serde_json::from_str::<IssueList>(content) {
+    match serde_json::from_str::<IssueList>(clean_content(content)) {
         Ok(list) => ProviderResponse::Issues(list.issues),
         Err(e) => ProviderResponse::Error(format!("Couldn't parse the local model's JSON payload: {e}")),
     }
+}
+
+/// Trims the non-JSON wrapping local models are prone to: a leading
+/// `<think>…</think>` block (thinking models on runtimes that inline reasoning into
+/// `content`, e.g. Ollama — LM Studio splits it out) and Markdown code fences.
+fn clean_content(content: &str) -> &str {
+    let mut s = content.trim();
+    if let Some(rest) = s.strip_prefix("<think>") {
+        if let Some((_, after)) = rest.split_once("</think>") {
+            s = after.trim();
+        }
+    }
+    if let Some(rest) = s.strip_prefix("```") {
+        // Opening fence may carry a language tag ("```json"); drop that first line,
+        // then the closing fence.
+        let rest = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
+        s = rest.rsplit_once("```").map(|(body, _)| body).unwrap_or(rest).trim();
+    }
+    s
 }
 
 #[cfg(test)]
@@ -134,6 +167,21 @@ mod tests {
     #[test]
     fn default_base_url_points_at_ollama() {
         assert_eq!(LocalConfig::default().base_url, "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn cleans_think_blocks_and_code_fences() {
+        assert_eq!(clean_content("<think>hmm, let me see</think>\n{\"issues\":[]}"), "{\"issues\":[]}");
+        assert_eq!(clean_content("```json\n{\"issues\":[]}\n```"), "{\"issues\":[]}");
+        assert_eq!(clean_content("<think>x</think>\n```json\n{\"issues\":[]}\n```"), "{\"issues\":[]}");
+        assert_eq!(clean_content("{\"issues\":[]}"), "{\"issues\":[]}");
+    }
+
+    #[test]
+    fn missing_timeout_in_saved_config_falls_back_to_default() {
+        // Configs saved before timeout_secs existed must still load.
+        let c: LocalConfig = serde_json::from_str(r#"{"base_url":"http://x/v1","model":"m"}"#).unwrap();
+        assert_eq!(c.timeout_secs, 180);
     }
 
     #[test]

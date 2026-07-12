@@ -20,7 +20,7 @@ use windows::Win32::UI::Accessibility::{
 /// Returns:
 /// `Some((start, len))` in UTF-16 code units for the first occurrence of `needle`, or
 /// `None` if `needle` isn't a substring of `haystack`.
-fn find_utf16_offset(haystack: &str, needle: &str) -> Option<(i32, i32)> {
+pub(super) fn find_utf16_offset(haystack: &str, needle: &str) -> Option<(i32, i32)> {
     let byte_idx = haystack.find(needle)?;
     let start = haystack[..byte_idx].encode_utf16().count() as i32;
     let len = needle.encode_utf16().count() as i32;
@@ -30,7 +30,7 @@ fn find_utf16_offset(haystack: &str, needle: &str) -> Option<(i32, i32)> {
 /// Builds a text range covering [start, start+len) (in UTF-16 code units) by walking a
 /// clone of the document range's endpoints, rather than trusting FindText's own
 /// (pickier) verbatim search.
-fn range_for_offset(tp: &IUIAutomationTextPattern, start: i32, len: i32) -> Option<IUIAutomationTextRange> {
+pub(super) fn range_for_offset(tp: &IUIAutomationTextPattern, start: i32, len: i32) -> Option<IUIAutomationTextRange> {
     unsafe {
         let range = tp.DocumentRange().ok()?;
         // Collapse End down onto Start (both end up at document position 0).
